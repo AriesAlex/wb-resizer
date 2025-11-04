@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Ресайзер для WB (минимум 900px, с паддингом при вытянутости)</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b0b0b;
+        --fg: #ffffff;
+        --accent: #6ae36a;
+        --muted: #8a8a8a;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        -webkit-text-size-adjust: 100%;
+      }
+      body {
+        display: grid;
+        place-items: center;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      }
+      .wrap {
+        width: 100%;
+        height: 100vh;
+        display: grid;
+        grid-template-rows: 1fr auto auto;
+        align-items: center;
+        justify-items: stretch;
+        gap: 16px;
+        padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+        box-sizing: border-box;
+      }
+      .btn {
+        display: grid;
+        place-items: center;
+        width: 100%;
+        height: 100%;
+        border: none;
+        border-radius: 14px;
+        background: #1e1e1e;
+        color: var(--fg);
+        font-size: clamp(18px, 6vw, 28px);
+        font-weight: 700;
+        letter-spacing: 0.2px;
+        line-height: 1.2;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .btn:active {
+        transform: scale(0.995);
+      }
+      .sub {
+        text-align: center;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .progress {
+        text-align: center;
+        font-size: 15px;
+        min-height: 1.5em;
+        color: var(--accent);
+        word-break: break-word;
+        white-space: pre-wrap;
+      }
+      input[type='file'] {
+        display: none;
+      }
+      .footer {
+        text-align: center;
+        font-size: 12px;
+        color: var(--muted);
+        opacity: 0.8;
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <button id="pick" class="btn">Выбрать и обработать фото</button>
+      <div class="progress" id="progress"></div>
+      <div class="sub">Правила: минимум 900px по каждой стороне. Если кадр слишком вытянут — добавим черные поля.</div>
+      <input id="file" type="file" accept="image/*" multiple />
+      <div class="footer">Совет: держите экран включенным на время обработки.</div>
+    </div>
+
+    <script>
+      // Настройки
+      const MIN_SIDE = 900 // минимальный размер по каждой стороне
+      const MAX_ASPECT = 1.5 // максимально допустимое соотношение сторон (ширина/высота или наоборот)
+      const JPEG_QUALITY = 0.92 // качество JPEG
+      const PADDING_COLOR = '#000' // цвет подложки при паддинге (черный)
+
+      const pickBtn = document.getElementById('pick')
+      const fileInput = document.getElementById('file')
+      const progressEl = document.getElementById('progress')
+
+      pickBtn.addEventListener('click', () => fileInput.click())
+      fileInput.addEventListener('change', () => {
+        const files = Array.from(fileInput.files || [])
+        if (!files.length) return
+        handleFiles(files)
+          .catch(err => {
+            console.error(err)
+            setProgress('Ошибка: ' + (err && err.message ? err.message : String(err)))
+          })
+          .finally(() => {
+            // сбрасываем input, чтобы можно было выбрать те же файлы повторно
+            fileInput.value = ''
+          })
+      })
+
+      function setProgress(text) {
+        progressEl.textContent = text || ''
+      }
+
+      async function handleFiles(files) {
+        setProgress(`Обработка 0 из ${files.length}...`)
+        let done = 0
+
+        for (const file of files) {
+          try {
+            await processAndDownload(file)
+          } catch (e) {
+            console.warn('Не удалось обработать файл', file.name, e)
+            setProgress(`Пропущен ${file.name}: ${e && e.message ? e.message : e}`)
+          }
+          done++
+          setProgress(`Обработка ${done} из ${files.length}...`)
+          // маленькая уступка циклу событий, чтобы UI не зависал
+          await new Promise(r => setTimeout(r, 0))
+        }
+
+        setProgress(`Готово! Обработано: ${done}. Скачивание запущено.`)
+      }
+
+      async function processAndDownload(file) {
+        // Пытаемся корректно учесть EXIF-ориентацию через createImageBitmap
+        let bitmap
+        try {
+          if ('createImageBitmap' in window) {
+            bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
+          } else {
+            bitmap = await loadViaImageTag(file)
+          }
+        } catch (e) {
+          // fallback на <img> если createImageBitmap не зашел
+          bitmap = await loadViaImageTag(file)
+        }
+
+        const srcW = bitmap.width
+        const srcH = bitmap.height
+        if (!srcW || !srcH) {
+          bitmap.close && bitmap.close()
+          throw new Error('Не удалось прочитать размеры изображения')
+        }
+
+        const aspect = srcW / srcH
+        const isElongated = aspect > MAX_ASPECT || aspect < 1 / MAX_ASPECT
+
+        let canvas, ctx
+
+        if (isElongated) {
+          // Вытянуто: кладем на квадратный холст 900x900 с черным фоном
+          const side = MIN_SIDE
+          canvas = newCanvas(side, side)
+          ctx = canvas.getContext('2d', { alpha: false })
+
+          // Заливаем фон
+          ctx.fillStyle = PADDING_COLOR
+          ctx.fillRect(0, 0, side, side)
+
+          // Масштабируем, чтобы целиком уместить в квадрат
+          const scale = Math.min(side / srcW, side / srcH)
+          const drawW = Math.round(srcW * scale)
+          const drawH = Math.round(srcH * scale)
+          const dx = Math.floor((side - drawW) / 2)
+          const dy = Math.floor((side - drawH) / 2)
+          ctx.imageSmoothingQuality = 'high'
+          ctx.drawImage(bitmap, 0, 0, srcW, srcH, dx, dy, drawW, drawH)
+        } else {
+          // Не вытянуто: увеличиваем/уменьшаем пропорционально, чтобы короткая сторона стала >= 900
+          const scale = Math.max(1, MIN_SIDE / Math.min(srcW, srcH))
+          const outW = Math.round(srcW * scale)
+          const outH = Math.round(srcH * scale)
+          canvas = newCanvas(outW, outH)
+          ctx = canvas.getContext('2d', { alpha: false })
+
+          ctx.imageSmoothingQuality = 'high'
+          ctx.drawImage(bitmap, 0, 0, srcW, srcH, 0, 0, outW, outH)
+        }
+
+        // Освобождаем bitmap
+        bitmap.close && bitmap.close()
+
+        const blob = await canvasToJpeg(canvas, JPEG_QUALITY)
+        const outName = makeOutputName(file.name, isElongated)
+        triggerDownload(blob, outName)
+      }
+
+      function newCanvas(w, h) {
+        const c = document.createElement('canvas')
+        c.width = Math.max(1, Math.floor(w))
+        c.height = Math.max(1, Math.floor(h))
+        return c
+      }
+
+      function canvasToJpeg(canvas, quality) {
+        return new Promise((resolve, reject) => {
+          if (canvas.toBlob) {
+            canvas.toBlob(
+              blob => {
+                if (blob) resolve(blob)
+                else reject(new Error('toBlob вернул null'))
+              },
+              'image/jpeg',
+              quality
+            )
+          } else {
+            // Fallback через dataURL
+            try {
+              const dataUrl = canvas.toDataURL('image/jpeg', quality)
+              const blob = dataURLtoBlob(dataUrl)
+              resolve(blob)
+            } catch (e) {
+              reject(e)
+            }
+          }
+        })
+      }
+
+      function dataURLtoBlob(dataurl) {
+        const [meta, data] = dataurl.split(',')
+        const isBase64 = /;base64$/i.test(meta)
+        const contentType = meta.split(':')[1].split(';')[0] || 'application/octet-stream'
+        let byteString
+        if (isBase64) {
+          byteString = atob(data)
+        } else {
+          byteString = decodeURIComponent(data)
+        }
+        const ia = new Uint8Array(byteString.length)
+        for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i)
+        return new Blob([ia], { type: contentType })
+      }
+
+      function triggerDownload(blob, filename) {
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        // На iOS Safari это может открыть предпросмотр — всё ок, файл можно сохранить оттуда
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        setTimeout(() => URL.revokeObjectURL(url), 10_000)
+      }
+
+      function makeOutputName(original, padded) {
+        const dot = original.lastIndexOf('.')
+        const base = dot > 0 ? original.slice(0, dot) : original
+        const suffix = padded ? '_wb_900sq' : '_wb_900min'
+        return sanitizeFilename(base + suffix) + '.jpg'
+      }
+
+      function sanitizeFilename(name) {
+        return (
+          name
+            .replace(/[\\/:*?"<>|]+/g, '_')
+            .trim()
+            .slice(0, 180) || 'image'
+        )
+      }
+
+      function loadViaImageTag(file) {
+        return new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(file)
+          const img = new Image()
+          // В некоторых браузерах помогает учесть ориентацию при отрисовке на canvas
+          img.decoding = 'async'
+          img.onload = () => {
+            try {
+              const c = newCanvas(img.naturalWidth || img.width, img.naturalHeight || img.height)
+              const ctx = c.getContext('2d', { alpha: false })
+              ctx.imageSmoothingQuality = 'high'
+              ctx.drawImage(img, 0, 0)
+              // Превращаем Canvas обратно в ImageBitmap для унификации
+              if ('createImageBitmap' in window) {
+                createImageBitmap(c).then(
+                  bmp => {
+                    URL.revokeObjectURL(url)
+                    resolve(bmp)
+                  },
+                  err => {
+                    URL.revokeObjectURL(url)
+                    reject(err)
+                  }
+                )
+              } else {
+                // Фоллбэк: создадим объект-псевдо-битмапа
+                const bmp = {
+                  width: c.width,
+                  height: c.height,
+                  close() {},
+                }
+                // Скопируем данные через drawImage позже; здесь вернем canvas через поле
+                // Но для совместимости перепакуем как ImageBitmap-подобный: вернем canvas напрямую
+                // и обработаем в вызывающем коде через drawImage(bitmap,...)
+                // Для простоты вернем canvas как bitmap (там есть width/height)
+                URL.revokeObjectURL(url)
+                resolve(c)
+              }
+            } catch (e) {
+              URL.revokeObjectURL(url)
+              reject(e)
+            }
+          }
+          img.onerror = () => {
+            URL.revokeObjectURL(url)
+            reject(new Error('Не удалось загрузить изображение (возможно формат не поддерживается)'))
+          }
+          img.src = url
+        })
+      }
+    </script>
+  </body>
+</html>
